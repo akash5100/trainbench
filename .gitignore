@@ -39,6 +39,8 @@ env/
 
 # Notebooks
 .ipynb_checkpoints/
+temp/
+data/
 
 # ML artifacts & logs
 wandb/

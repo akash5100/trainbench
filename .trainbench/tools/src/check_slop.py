@@ -31,6 +31,8 @@ ENTRY_DECORATORS = frozenset(
     "abstractmethod",
     "override",
     "cached_property",
+    "classmethod",
+    "staticmethod",
     "compact",
     "jit",
     "no_grad",
@@ -40,6 +42,20 @@ ENTRY_DECORATORS = frozenset(
   }
 )
 ENTRY_DECORATOR_OWNERS = frozenset({"cli", "jax", "torch"})
+FRAMEWORK_METHODS = frozenset(
+  {
+    "forward",
+    "train",
+    "eval",
+    "state_dict",
+    "load_state_dict",
+    "reset_parameters",
+    "extra_repr",
+    "from_pretrained",
+    "_init_weights",
+    "init_weights",
+  }
+)
 
 
 @dataclass(frozen=True)
@@ -83,7 +99,7 @@ def is_source_python_file(rel_path: Path) -> bool:
     return False
   if any(part in SKIP_DIRS for part in parts):
     return False
-  return "src" in parts or parts[:2] == ("libs", "warp")
+  return True
 
 
 def get_base_ref(repo_root: Path) -> str:
@@ -369,7 +385,7 @@ def collect_defined_symbols(tree: ast.AST) -> list[tuple[str, int, int, bool]]:
   """
   symbols: list[tuple[str, int, int, bool]] = []
 
-  def visit_body(body: list[ast.stmt]) -> None:
+  def visit_body(body: list[ast.stmt], in_class: bool = False) -> None:
     for stmt in body:
       if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
         end_line = stmt.end_lineno or stmt.lineno
@@ -378,12 +394,14 @@ def collect_defined_symbols(tree: ast.AST) -> list[tuple[str, int, int, bool]]:
           for base in stmt.bases:
             if isinstance(base, ast.Name) and base.id.endswith(("Error", "Exception")):
               is_entry = True
+        elif in_class:
+          is_entry = True
         symbols.append((stmt.name, stmt.lineno, end_line - stmt.lineno + 1, is_entry))
         if isinstance(stmt, ast.ClassDef):
-          visit_body(stmt.body)
+          visit_body(stmt.body, in_class=True)
 
   if isinstance(tree, ast.Module):
-    visit_body(tree.body)
+    visit_body(tree.body, in_class=False)
   return symbols
 
 
