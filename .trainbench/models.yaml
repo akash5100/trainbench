@@ -1,0 +1,10 @@
+# ━━━━━━━━ model profiles ━━━━━━━━
+# Harness options are inline JSON objects (valid YAML) for dependency-free lookup.
+small:
+  codex: {"model":"gpt-6-terra","reasoning_effort":"high"}
+  antigravity: {"model":"flash"}
+  ccode: {"model":"sonnet-5.5","reasoning_effort":"high"}
+large:
+  codex: {"model":"gpt-6.1-sol","reasoning_effort":"high"}
+  antigravity: {"model":"flash"}
+  ccode: {"model":"opus-5.5","reasoning_effort":"high"}

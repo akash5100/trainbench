@@ -1,0 +1,32 @@
+{
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.11",
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownParameterType": false,
+  "reportMissingTypeStubs": false,
+  "reportUnusedImport": "warning",
+  "reportPrivateImportUsage": false,
+  "reportUnknownMemberType": false,
+  "include": [
+    "trainbench",
+    "experiments",
+    "tests"
+  ],
+  "exclude": [
+    "**/build/**",
+    "**/dist/**",
+    "**/__pycache__/**",
+    "**/.venv/**",
+    "**/.trainbench/worktree/**",
+    "**/.trainbench/.cache/**"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "./",
+      "extraPaths": [
+        "."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing / Coverage / Linting
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.env
+.envrc
+.venv/
+venv/
+env/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# ML artifacts & logs
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+
+# Local agent harness projections & ephemeral state
+/.agents/
+/.codex/
+/.claude/
+/.trainbench/.cache/
+/.trainbench/worktree/*
+!/.trainbench/worktree/.gitkeep
