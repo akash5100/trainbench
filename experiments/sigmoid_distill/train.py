@@ -421,19 +421,19 @@ def main() -> None:
   teacher_logits_path = cache_dir / "teacher_logits_train.npz"
   teacher_head_ckpt_path = save_dir / "teacher_head_best.pt"
 
-  # Initialize remote telemetry logger on primary rank
-  if args.wandb and (local_rank == 0):
-    try:
-      import wandb
-
-      wandb.init(project=args.project, name=args.run_name, config=vars(args))
-    except ImportError:
-      print_rank0("WandB requested but not installed. Skipping remote logging.")
-
   # ━━━━━━━━ Phase 1: Teacher Training & Logit Caching ━━━━━━━━
   if teacher_logits_path.exists() and not args.no_cache:
     print_rank0(f"Found cached teacher logits at {teacher_logits_path}. Skipping Phase 1.")
   else:
+    if args.wandb and (local_rank == 0):
+      try:
+        import wandb
+
+        teacher_run_name = f"teacher_{Path(args.teacher_model).name}"
+        wandb.init(project=args.project, name=teacher_run_name, config=vars(args))
+      except ImportError:
+        print_rank0("WandB requested but not installed. Skipping remote logging.")
+
     print_rank0(f"Phase 1: Initializing teacher model ({args.teacher_model})...")
     teacher_cfg = LitClassifierConfig.from_pretrained(
       model_id=args.teacher_model,
@@ -641,6 +641,17 @@ def main() -> None:
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
 
+    # Finalize teacher WandB session so student starts fresh from step 0
+    if args.wandb and (local_rank == 0):
+      shutdown_logger(wait=True)
+      try:
+        import wandb
+
+        if wandb.run is not None:
+          wandb.finish()
+      except Exception:
+        pass
+
   # ━━━━━━━━ Phase 2: Student Embeddings Extraction & Alignment ━━━━━━━━
   student_embeds_train_path = cache_dir / "student_embeds_train.npz"
   student_embeds_val_path = cache_dir / "student_embeds_val.npz"
@@ -713,6 +724,14 @@ def main() -> None:
   print_rank0(f"Verified 1:1 image_id alignment across {len(s_train_ids)} train samples.")
 
   # ━━━━━━━━ Phase 3: Student Distillation Training ━━━━━━━━
+  if args.wandb and (local_rank == 0):
+    try:
+      import wandb
+
+      wandb.init(project=args.project, name=args.run_name, config=vars(args))
+    except ImportError:
+      print_rank0("WandB requested but not installed. Skipping remote logging.")
+
   print_rank0(f"Phase 3: Starting student distillation (alpha={args.alpha}, temperature={args.temperature}, epochs={args.student_epochs})...")
   student_train_ds = TensorDataset(s_train_embeds, s_train_targets, t_train_logits)
   student_sampler = DistributedSampler(student_train_ds, shuffle=True) if is_ddp else None
