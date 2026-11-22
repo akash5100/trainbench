@@ -14,10 +14,11 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 
 from trainbench.losses.torch import BCEWithLogitsLoss, SigmoidDistillationLoss
+from trainbench.metrics.torch import compute_multi_label_metrics
 from trainbench.models.torch.lit_classifier import LitClassifierConfig, LitClassifierModel, LitClassifierProcessor, MultiLabelHead
 from trainbench.utils import log_async, shutdown_logger
 from trainbench.utils.torch import clip_gradients, configure_mixed_precision, get_autocast_dtype, get_device, print_rank0, seed_everything, setup_ddp
@@ -40,8 +41,22 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--load-head", type=str, default=None, help="Optional checkpoint path to initialize student head")
 
   # Distillation Hyperparameters (Scalar)
-  parser.add_argument("--alpha", type=float, default=0.5, help="Distillation loss weight (0 = pure BCE, 1 = pure distillation)")
-  parser.add_argument("--temperature", type=float, default=1.0, help="Distillation temperature scaling")
+  parser.add_argument(
+    "--kd-alpha",
+    "--alpha",
+    dest="alpha",
+    type=float,
+    default=0.5,
+    help="Knowledge distillation loss weight: loss = alpha * loss_kd + (1 - alpha) * loss_gt (0 = pure GT baseline)",
+  )
+  parser.add_argument(
+    "--kd-temperature",
+    "--temperature",
+    dest="temperature",
+    type=float,
+    default=1.0,
+    help="Knowledge distillation temperature scaling for soft target smoothing",
+  )
 
   # Optimization Configuration
   parser.add_argument("--teacher-epochs", type=int, default=10, help="Epochs to train teacher projection head")
@@ -92,8 +107,11 @@ def extract_embeddings_to_cache(
   all_targets: list[torch.Tensor] = []
   all_ids: list[int] = []
 
+  total_batches = len(loader)
+  start_time = time.time()
+
   with torch.no_grad():
-    for images, targets, ids in loader:
+    for step, (images, targets, ids) in enumerate(loader, start=1):
       images = images.to(device)
       embeds = model.forward_features(images)
       all_embeds.append(embeds.cpu())
@@ -102,6 +120,13 @@ def extract_embeddings_to_cache(
         all_ids.extend(ids.tolist())
       else:
         all_ids.extend(list(ids))
+
+      if step % 50 == 0 or step == total_batches:
+        elapsed = time.time() - start_time
+        speed = step / max(1e-5, elapsed)
+        eta = (total_batches - step) / max(1e-5, speed)
+        rank_str = f"[GPU {device.index}] " if (device.type == "cuda" and device.index is not None) else ""
+        print(f"  {rank_str}[Extraction] Batch {step:04d}/{total_batches:04d} | Speed: {speed:.1f} b/s | ETA: {eta:.0f}s")
 
   embeds_cat = torch.cat(all_embeds, dim=0)
   targets_cat = torch.cat(all_targets, dim=0)
@@ -125,11 +150,65 @@ def load_or_extract_embeddings(
   loader: DataLoader[Any],
   device: torch.device,
   no_cache: bool = False,
+  is_ddp: bool = False,
+  local_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
-  """Loads cached embeddings or extracts them if not present on disk."""
+  """Loads cached embeddings or extracts them across all available GPUs in parallel."""
   cache_path = cache_dir / f"{prefix}_embeds_{split}.npz"
   if cache_path.exists() and not no_cache:
     print_rank0(f"Loading cached {prefix} {split} embeddings from {cache_path}...")
+    with np.load(cache_path) as data:
+      embeds = torch.from_numpy(data["embeddings"])
+      targets = torch.from_numpy(data["targets"])
+      image_ids = data["image_ids"]
+    return embeds, targets, image_ids
+
+  world_size = dist.get_world_size() if (is_ddp and dist.is_initialized()) else 1
+
+  if world_size > 1:
+    dataset = loader.dataset
+    total_samples = len(dataset)
+    chunk = (total_samples + world_size - 1) // world_size
+    start_idx = local_rank * chunk
+    end_idx = min(total_samples, start_idx + chunk)
+
+    shard_ds = Subset(dataset, range(start_idx, end_idx))
+    shard_loader: DataLoader[Any] = DataLoader(
+      shard_ds,
+      batch_size=loader.batch_size,
+      shuffle=False,
+      num_workers=loader.num_workers,
+      pin_memory=torch.cuda.is_available(),
+    )
+    shard_path = cache_dir / f"{prefix}_embeds_{split}_shard_{local_rank}.npz"
+    print(f"[Rank {local_rank}] Extracting {prefix} {split} shard ({len(shard_ds)} samples)...")
+    extract_embeddings_to_cache(model, shard_loader, device, shard_path)
+
+    dist.barrier()
+
+    if local_rank == 0:
+      all_embeds: list[np.ndarray] = []
+      all_targets: list[np.ndarray] = []
+      all_ids: list[np.ndarray] = []
+
+      for r in range(world_size):
+        sp = cache_dir / f"{prefix}_embeds_{split}_shard_{r}.npz"
+        with np.load(sp) as d:
+          all_embeds.append(d["embeddings"])
+          all_targets.append(d["targets"])
+          all_ids.append(d["image_ids"])
+        sp.unlink(missing_ok=True)
+
+      np.savez_compressed(
+        cache_path,
+        embeddings=np.concatenate(all_embeds, axis=0),
+        targets=np.concatenate(all_targets, axis=0),
+        image_ids=np.concatenate(all_ids, axis=0),
+      )
+      print_rank0(f"Merged and saved {sum(len(x) for x in all_embeds)} {prefix} {split} embeddings to {cache_path}.")
+
+    dist.barrier()
+
     with np.load(cache_path) as data:
       embeds = torch.from_numpy(data["embeddings"])
       targets = torch.from_numpy(data["targets"])
@@ -146,13 +225,27 @@ def load_or_extract_embeddings(
 
 
 def build_optimizer(model: nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
-  """Configures AdamW with weight decay decoupled from 1D biases and normalization layers."""
+  """Configures AdamW with decoupled weight decay applied strictly to 2D+ projection kernels.
+
+  Parameter Partitioning Rationale (Karpathy's nanoGPT ndim >= 2 heuristic):
+    1. 2D+ tensors (weights, linear projections, conv kernels):
+       Weight decay bounds the matrix Frobenius norm and Lipschitz constant, regularizing
+       model capacity and reducing variance.
+    2. 1D tensors (biases, LayerNorm/RMSNorm scale gamma and shift beta):
+       - Biases: purely affine shifts (y = Wx + b). Decaying biases does not constrain model
+         expressivity, but shifts activation centering away from optimal distributions.
+       - Norm scales (gamma): Normalization layers scale variance to 1. Decaying gamma -> 0
+         actively fights the normalization layer, artificially suppressing activation magnitude.
+    3. Dimensionality check (p.ndim >= 2) is robust and architecture-agnostic compared to
+       fragile layer name string-matching (e.g. 'bias', 'ln_1', 'layer_norm', 'scale').
+  """
   decay_params: list[torch.nn.Parameter] = []
   no_decay_params: list[torch.nn.Parameter] = []
 
   for _, param in model.named_parameters():
     if not param.requires_grad:
       continue
+    # 2D+ weights receive decoupled weight decay; 1D biases and norm scales receive 0.0 decay
     if param.ndim >= 2:
       decay_params.append(param)
     else:
@@ -191,27 +284,21 @@ def train_one_epoch(
   global_step = global_step_start
 
   for step, batch in enumerate(dataloader):
-    if len(batch) == 3:
-      embeds, targets, teacher_logits = batch
-      embeds = embeds.to(device)
-      targets = targets.to(device)
-      teacher_logits = teacher_logits.to(device)
-      with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=scaler.is_enabled()):
-        logits = model(embeds)
-        loss_dict = criterion(logits, teacher_logits, targets)
-        loss = loss_dict["loss"] / accum_steps
-    else:
-      embeds, targets = batch
-      embeds = embeds.to(device)
-      targets = targets.to(device)
-      with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=scaler.is_enabled()):
-        logits = model(embeds)
-        loss = criterion(logits, targets) / accum_steps
+    # Transfer inputs to target accelerator device
+    embeds, targets = batch[0].to(device), batch[1].to(device)
 
+    # Forward pass and scaled loss calculation under mixed precision
+    with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=scaler.is_enabled()):
+      logits = model(embeds)
+      raw_loss = criterion(logits, batch[2].to(device), targets)["loss"] if len(batch) == 3 else criterion(logits, targets)
+      loss = raw_loss / accum_steps
+
+    # Backward pass with dynamic loss scaling
     scaler.scale(loss).backward()
     total_loss += loss.item() * accum_steps
     num_batches += 1
 
+    # Optimizer step, gradient unscaling, and clipping at accumulation boundaries
     if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
       scaler.unscale_(optimizer)
       grad_norm = clip_gradients(model, max_norm=clip_grad)
@@ -225,6 +312,7 @@ def train_one_epoch(
       global_step += 1
       num_updates += 1
 
+      # Asynchronous step-level metric logging
       if log_fn:
         current_lr = optimizer.param_groups[0]["lr"]
         log_fn(
@@ -236,6 +324,7 @@ def train_one_epoch(
           global_step,
         )
 
+  # Compile epoch-level loss and gradient norm summary
   metrics = {
     "loss": total_loss / max(1, num_batches),
     "grad_norm": total_grad_norm / max(1, num_updates),
@@ -256,70 +345,20 @@ def validate(
   all_logits_list: list[torch.Tensor] = []
   all_targets_list: list[torch.Tensor] = []
 
+  # Forward pass across validation batches under mixed precision
   with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_amp):
     for batch in dataloader:
-      embeds, targets = batch[0], batch[1]
-      embeds = embeds.to(device)
+      embeds, targets = batch[0].to(device), batch[1]
       logits = model(embeds)
       all_logits_list.append(logits.detach().cpu())
       all_targets_list.append(targets.cpu())
 
-  all_logits = torch.cat(all_logits_list, dim=0).float()
-  all_targets = torch.cat(all_targets_list, dim=0).float()
+  # Concatenate predictions across all batches
+  all_logits = torch.cat(all_logits_list, dim=0)
+  all_targets = torch.cat(all_targets_list, dim=0)
 
-  bce_fn = BCEWithLogitsLoss(reduction="mean")
-  val_loss = bce_fn(all_logits, all_targets).item()
-
-  probs = torch.sigmoid(all_logits)
-  preds = (probs >= 0.5).float()
-
-  # Macro F1 (at threshold 0.5, averaged over classes with >= 1 positive in val)
-  f1_list: list[float] = []
-  for c in range(all_targets.shape[1]):
-    c_targets = all_targets[:, c]
-    if c_targets.sum() > 0:
-      c_preds = preds[:, c]
-      tp = ((c_preds == 1.0) & (c_targets == 1.0)).sum().float()
-      fp = ((c_preds == 1.0) & (c_targets == 0.0)).sum().float()
-      fn = ((c_preds == 0.0) & (c_targets == 1.0)).sum().float()
-      prec = (tp / (tp + fp)).item() if (tp + fp) > 0 else 0.0
-      rec = (tp / (tp + fn)).item() if (tp + fn) > 0 else 0.0
-      f1 = (2.0 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
-      f1_list.append(f1)
-  macro_f1 = float(np.mean(f1_list)) if f1_list else 0.0
-
-  # Mean Average Precision across classes with >= 1 positive in val
-  ap_list: list[float] = []
-  for c in range(all_targets.shape[1]):
-    c_targets = all_targets[:, c]
-    n_pos = int(c_targets.sum().item())
-    if n_pos > 0:
-      order = torch.argsort(probs[:, c], descending=True)
-      sorted_targets = c_targets[order]
-      cum_tp = torch.cumsum(sorted_targets, dim=0)
-      ranks = torch.arange(1, len(sorted_targets) + 1, dtype=torch.float32)
-      precisions = cum_tp / ranks
-      ap = ((precisions * sorted_targets).sum() / float(n_pos)).item()
-      ap_list.append(ap)
-  map_score = float(np.mean(ap_list)) if ap_list else 0.0
-
-  # Mean predicted probability on true-negative entries
-  neg_mask = all_targets == 0.0
-  neg_prob_mean = probs[neg_mask].mean().item() if neg_mask.any() else 0.0
-
-  # False positive count on highest-frequency class
-  maj_class = int(all_targets.sum(dim=0).argmax().item())
-  maj_preds = preds[:, maj_class]
-  maj_targets = all_targets[:, maj_class]
-  majority_fp = int(((maj_preds == 1.0) & (maj_targets == 0.0)).sum().item())
-
-  return {
-    "loss": val_loss,
-    "macro_f1": macro_f1,
-    "map": map_score,
-    "neg_prob_mean": neg_prob_mean,
-    "majority_fp": float(majority_fp),
-  }
+  # Compute standardized multi-label classification and calibration metrics
+  return compute_multi_label_metrics(all_logits, all_targets)
 
 
 # ━━━━━━━━ Main Entrypoint ━━━━━━━━
@@ -330,16 +369,18 @@ def main() -> None:
   args = parse_args()
 
   # ━━━━━━━━ Hardware & Distributed Runtime ━━━━━━━━
+  # Seed random number generators for reproducible initialization
   seed_everything(args.seed)
-  local_rank, is_ddp = setup_ddp()
-  if torch.cuda.is_available() and is_ddp:
-    device = torch.device(f"cuda:{local_rank}")
-  else:
-    device = get_device(verbose=(local_rank == 0))
 
+  # Initialize distributed communication backend and resolve accelerator rank
+  local_rank, is_ddp = setup_ddp()
+  device = torch.device(f"cuda:{local_rank}") if (torch.cuda.is_available() and is_ddp) else get_device(verbose=(local_rank == 0))
+
+  # Configure automatic mixed precision scaler and compute datatype
   scaler = configure_mixed_precision(args.mixed_precision, device=device)
   autocast_dtype = get_autocast_dtype(device)
 
+  # Ensure destination cache and checkpoint directories exist
   cache_dir = Path(args.cache_dir)
   cache_dir.mkdir(parents=True, exist_ok=True)
   save_dir = Path(args.save_dir)
@@ -348,6 +389,7 @@ def main() -> None:
   teacher_logits_path = cache_dir / "teacher_logits_train.npz"
   teacher_head_ckpt_path = save_dir / "teacher_head_best.pt"
 
+  # Initialize remote telemetry logger on primary rank
   if args.wandb and (local_rank == 0):
     try:
       import wandb
@@ -379,28 +421,28 @@ def main() -> None:
       shuffle=False,
     )
 
-    if is_ddp:
-      if local_rank == 0:
-        load_or_extract_embeddings(
-          prefix="teacher", split="train", cache_dir=cache_dir, model=teacher_model, loader=raw_train_loader, device=device, no_cache=args.no_cache
-        )
-        load_or_extract_embeddings(
-          prefix="teacher", split="val", cache_dir=cache_dir, model=teacher_model, loader=raw_val_loader, device=device, no_cache=args.no_cache
-        )
-      dist.barrier()
-      t_train_embeds, t_train_targets, t_train_ids = load_or_extract_embeddings(
-        prefix="teacher", split="train", cache_dir=cache_dir, model=teacher_model, loader=raw_train_loader, device=device, no_cache=False
-      )
-      t_val_embeds, t_val_targets, _ = load_or_extract_embeddings(
-        prefix="teacher", split="val", cache_dir=cache_dir, model=teacher_model, loader=raw_val_loader, device=device, no_cache=False
-      )
-    else:
-      t_train_embeds, t_train_targets, t_train_ids = load_or_extract_embeddings(
-        prefix="teacher", split="train", cache_dir=cache_dir, model=teacher_model, loader=raw_train_loader, device=device, no_cache=args.no_cache
-      )
-      t_val_embeds, t_val_targets, _ = load_or_extract_embeddings(
-        prefix="teacher", split="val", cache_dir=cache_dir, model=teacher_model, loader=raw_val_loader, device=device, no_cache=args.no_cache
-      )
+    t_train_embeds, t_train_targets, t_train_ids = load_or_extract_embeddings(
+      prefix="teacher",
+      split="train",
+      cache_dir=cache_dir,
+      model=teacher_model,
+      loader=raw_train_loader,
+      device=device,
+      no_cache=args.no_cache,
+      is_ddp=is_ddp,
+      local_rank=local_rank,
+    )
+    t_val_embeds, t_val_targets, _ = load_or_extract_embeddings(
+      prefix="teacher",
+      split="val",
+      cache_dir=cache_dir,
+      model=teacher_model,
+      loader=raw_val_loader,
+      device=device,
+      no_cache=args.no_cache,
+      is_ddp=is_ddp,
+      local_rank=local_rank,
+    )
 
     print_rank0(f"Training teacher projection head for {args.teacher_epochs} epochs (DDP={is_ddp})...")
     teacher_train_ds = TensorDataset(t_train_embeds, t_train_targets)
@@ -479,9 +521,52 @@ def main() -> None:
     elif teacher_head_ckpt_path.exists():
       raw_head.load_state_dict(torch.load(teacher_head_ckpt_path, map_location="cpu"))
 
-    if local_rank == 0:
+    world_size = dist.get_world_size() if (is_ddp and dist.is_initialized()) else 1
+    raw_head.eval()
+
+    if world_size > 1:
+      total_t = len(t_train_embeds)
+      chunk_t = (total_t + world_size - 1) // world_size
+      start_t = local_rank * chunk_t
+      end_t = min(total_t, start_t + chunk_t)
+
+      shard_t_embeds = t_train_embeds[start_t:end_t]
+      shard_t_ids = t_train_ids[start_t:end_t]
+
+      shard_logits: list[torch.Tensor] = []
+      det_loader = DataLoader(TensorDataset(shard_t_embeds), batch_size=args.batch_size, shuffle=False)
+      with torch.no_grad():
+        for (batch_embeds,) in det_loader:
+          batch_embeds = batch_embeds.to(device)
+          logits = raw_head(batch_embeds)
+          shard_logits.append(logits.cpu())
+
+      shard_logits_arr = torch.cat(shard_logits, dim=0).numpy() if shard_logits else np.empty((0, args.num_classes), dtype=np.float32)
+      t_shard_path = cache_dir / f"teacher_logits_shard_{local_rank}.npz"
+      np.savez_compressed(t_shard_path, logits=shard_logits_arr, image_ids=shard_t_ids)
+
+      dist.barrier()
+
+      if local_rank == 0:
+        all_t_logits = []
+        all_t_ids = []
+        for r in range(world_size):
+          sp = cache_dir / f"teacher_logits_shard_{r}.npz"
+          with np.load(sp) as d:
+            all_t_logits.append(d["logits"])
+            all_t_ids.append(d["image_ids"])
+          sp.unlink(missing_ok=True)
+
+        np.savez_compressed(
+          teacher_logits_path,
+          logits=np.concatenate(all_t_logits, axis=0),
+          image_ids=np.concatenate(all_t_ids, axis=0),
+        )
+        print_rank0(f"Saved {sum(len(x) for x in all_t_logits)} teacher train logits to {teacher_logits_path}.")
+
+      dist.barrier()
+    else:
       print_rank0("Computing teacher logits on train split for distillation cache...")
-      raw_head.eval()
       t_logits_list: list[torch.Tensor] = []
       deterministic_t_loader = DataLoader(
         TensorDataset(t_train_embeds),
@@ -501,9 +586,6 @@ def main() -> None:
         image_ids=t_train_ids,
       )
       print_rank0(f"Saved {len(t_logits_all)} teacher train logits to {teacher_logits_path}.")
-
-    if is_ddp:
-      dist.barrier()
 
     del teacher_model
     del teacher_head
@@ -535,28 +617,28 @@ def main() -> None:
       shuffle=False,
     )
 
-    if is_ddp:
-      if local_rank == 0:
-        load_or_extract_embeddings(
-          prefix="student", split="train", cache_dir=cache_dir, model=student_model, loader=raw_s_train_loader, device=device, no_cache=args.no_cache
-        )
-        load_or_extract_embeddings(
-          prefix="student", split="val", cache_dir=cache_dir, model=student_model, loader=raw_s_val_loader, device=device, no_cache=args.no_cache
-        )
-      dist.barrier()
-      s_train_embeds, s_train_targets, s_train_ids = load_or_extract_embeddings(
-        prefix="student", split="train", cache_dir=cache_dir, model=student_model, loader=raw_s_train_loader, device=device, no_cache=False
-      )
-      s_val_embeds, s_val_targets, _ = load_or_extract_embeddings(
-        prefix="student", split="val", cache_dir=cache_dir, model=student_model, loader=raw_s_val_loader, device=device, no_cache=False
-      )
-    else:
-      s_train_embeds, s_train_targets, s_train_ids = load_or_extract_embeddings(
-        prefix="student", split="train", cache_dir=cache_dir, model=student_model, loader=raw_s_train_loader, device=device, no_cache=args.no_cache
-      )
-      s_val_embeds, s_val_targets, _ = load_or_extract_embeddings(
-        prefix="student", split="val", cache_dir=cache_dir, model=student_model, loader=raw_s_val_loader, device=device, no_cache=args.no_cache
-      )
+    s_train_embeds, s_train_targets, s_train_ids = load_or_extract_embeddings(
+      prefix="student",
+      split="train",
+      cache_dir=cache_dir,
+      model=student_model,
+      loader=raw_s_train_loader,
+      device=device,
+      no_cache=args.no_cache,
+      is_ddp=is_ddp,
+      local_rank=local_rank,
+    )
+    s_val_embeds, s_val_targets, _ = load_or_extract_embeddings(
+      prefix="student",
+      split="val",
+      cache_dir=cache_dir,
+      model=student_model,
+      loader=raw_s_val_loader,
+      device=device,
+      no_cache=args.no_cache,
+      is_ddp=is_ddp,
+      local_rank=local_rank,
+    )
 
     del student_model
     if torch.cuda.is_available():
