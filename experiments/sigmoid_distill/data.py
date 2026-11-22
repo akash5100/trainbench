@@ -106,6 +106,7 @@ def build_dataloaders(
   processor=None,
   transform=None,
   num_workers: int = 0,
+  shuffle: bool = True,
 ) -> tuple[DataLoader, DataLoader, list[str]]:
   """Builds train and val PyTorch DataLoaders for MS-COCO 2017.
 
@@ -129,7 +130,7 @@ def build_dataloaders(
   train_loader = DataLoader(
     train_ds,
     batch_size=batch_size,
-    shuffle=True,
+    shuffle=shuffle,
     num_workers=num_workers,
     pin_memory=torch.cuda.is_available(),
   )

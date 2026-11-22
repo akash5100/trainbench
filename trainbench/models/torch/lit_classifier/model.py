@@ -52,7 +52,7 @@ class MultiLabelHead(nn.Module):
 class LitClassifierModel(nn.Module):
   """Multi-label image classifier with frozen or fine-tunable vision backbone and multi-stage head."""
 
-  def __init__(self, config: LitClassifierConfig | None = None, pretrained: bool = False) -> None:
+  def __init__(self, config: LitClassifierConfig | None = None, pretrained: bool = True) -> None:
     """Initializes vision backbone (loading only the vision tower) and classification head."""
     super().__init__()
     self.config = config if config is not None else LitClassifierConfig()

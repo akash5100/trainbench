@@ -9,7 +9,7 @@ from trainbench.models.torch.lit_classifier.model import MultiLabelHead
 def test_lit_classifier_config_defaults() -> None:
   cfg = LitClassifierConfig()
   assert cfg.model_id == "google/siglip2-base-patch16-256"
-  assert cfg.image_size == 224
+  assert cfg.image_size == 256
   assert cfg.embed_dim == 768
   assert cfg.num_classes == 80
   assert cfg.image_mean == [0.5, 0.5, 0.5]
@@ -39,11 +39,11 @@ def test_multilabel_head() -> None:
 
 
 def test_lit_classifier_model_forward() -> None:
-  cfg = LitClassifierConfig(model_id="google/siglip2-base-patch16-256", num_classes=80)
-  model = LitClassifierModel(cfg)
+  cfg = LitClassifierConfig(model_id="google/siglip2-base-patch16-256", image_size=256, num_classes=80)
+  model = LitClassifierModel(cfg, pretrained=False)
   model.eval()
 
-  dummy_pixels = torch.randn(2, 3, 224, 224)
+  dummy_pixels = torch.randn(2, 3, 256, 256)
   with torch.no_grad():
     logits_pixels = model(pixel_values=dummy_pixels)
   assert logits_pixels.shape == (2, 80)

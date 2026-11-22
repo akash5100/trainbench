@@ -148,9 +148,9 @@ trainbench/
 │   ├── models/
 │   │   ├── torch/            # PyTorch backbones & heads (GPU)
 │   │   └── jax/              # Flax NNX / JAX models (TPU)
-│   ├── trainers/
-│   │   ├── torch/            # Pure step helpers, AMP & DDP utilities
-│   │   └── jax/              # Pure grad_step / apply_step, sharding & remat helpers
+│   ├── utils/
+│   │   ├── torch/            # Runtime, AMP, seeding, and DDP utilities
+│   │   └── jax/              # Pure sharding, precision, and seed helpers
 │   ├── optim/
 │   │   ├── torch/            # PyTorch optimizers & schedules
 │   │   └── jax/              # Optax transforms & schedules

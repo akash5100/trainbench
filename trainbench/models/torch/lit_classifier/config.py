@@ -15,7 +15,7 @@ class LitClassifierConfig:
   """Configuration for LitClassifier model."""
 
   model_id: str = "google/siglip2-base-patch16-256"
-  image_size: int = 224
+  image_size: int = 256
   image_mean: list[float] = field(default_factory=lambda: list(SIGLIP_MEAN))
   image_std: list[float] = field(default_factory=lambda: list(SIGLIP_STD))
   embed_dim: int = 768
