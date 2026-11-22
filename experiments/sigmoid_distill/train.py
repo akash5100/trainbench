@@ -100,6 +100,7 @@ def extract_embeddings_to_cache(
   loader: DataLoader[Any],
   device: torch.device,
   cache_path: Path,
+  autocast_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
   """Runs a forward extraction pass across a DataLoader and caches embeddings and image IDs to disk."""
   model.eval()
@@ -108,25 +109,55 @@ def extract_embeddings_to_cache(
   all_ids: list[int] = []
 
   total_batches = len(loader)
-  start_time = time.time()
+  overall_start = time.time()
+  use_amp = autocast_dtype is not None and device.type == "cuda"
+  effective_dtype = autocast_dtype if autocast_dtype is not None else torch.float32
+
+  loader_iter = iter(loader)
+  step = 0
 
   with torch.no_grad():
-    for step, (images, targets, ids) in enumerate(loader, start=1):
-      images = images.to(device)
-      embeds = model.forward_features(images)
-      all_embeds.append(embeds.cpu())
+    while step < total_batches:
+      t0 = time.time()
+      try:
+        images, targets, ids = next(loader_iter)
+      except StopIteration:
+        break
+      step += 1
+      t_data = time.time()
+
+      images = images.to(device, non_blocking=True)
+      with torch.amp.autocast(device_type=device.type, dtype=effective_dtype, enabled=use_amp):
+        embeds = model.forward_features(images)
+
+      if device.type == "cuda":
+        torch.cuda.synchronize(device)
+      t_fwd = time.time()
+
+      all_embeds.append(embeds.float().cpu())
       all_targets.append(targets.cpu())
       if isinstance(ids, torch.Tensor):
         all_ids.extend(ids.tolist())
       else:
         all_ids.extend(list(ids))
 
-      if step % 50 == 0 or step == total_batches:
-        elapsed = time.time() - start_time
-        speed = step / max(1e-5, elapsed)
-        eta = (total_batches - step) / max(1e-5, speed)
+      # step latency telemetry: data loader time vs GPU forward compute time
+      if step % 20 == 0 or step == total_batches or step == 1:
+        data_ms = (t_data - t0) * 1000.0
+        fwd_ms = (t_fwd - t_data) * 1000.0
+        dt_ms = (t_fwd - t0) * 1000.0
+        batch_size = images.shape[0]
+        img_s = batch_size / max(1e-5, (t_fwd - t0))
+        elapsed_total = t_fwd - overall_start
+        overall_speed = step / max(1e-5, elapsed_total)
+        eta_s = (total_batches - step) / max(1e-5, overall_speed)
         rank_str = f"[GPU {device.index}] " if (device.type == "cuda" and device.index is not None) else ""
-        print(f"  {rank_str}[Extraction] Batch {step:04d}/{total_batches:04d} | Speed: {speed:.1f} b/s | ETA: {eta:.0f}s", flush=True)
+        print(
+          f"  {rank_str}[Extraction] Batch {step:04d}/{total_batches:04d} | "
+          f"data: {data_ms:6.1f}ms | fwd: {fwd_ms:6.1f}ms | dt: {dt_ms:6.1f}ms | "
+          f"{img_s:6.1f} img/s | ETA: {eta_s:5.0f}s",
+          flush=True,
+        )
 
   embeds_cat = torch.cat(all_embeds, dim=0)
   targets_cat = torch.cat(all_targets, dim=0)
@@ -152,6 +183,7 @@ def load_or_extract_embeddings(
   no_cache: bool = False,
   is_ddp: bool = False,
   local_rank: int = 0,
+  autocast_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
   """Loads cached embeddings or extracts them across all available GPUs in parallel."""
   cache_path = cache_dir / f"{prefix}_embeds_{split}.npz"
@@ -181,8 +213,8 @@ def load_or_extract_embeddings(
       pin_memory=torch.cuda.is_available(),
     )
     shard_path = cache_dir / f"{prefix}_embeds_{split}_shard_{local_rank}.npz"
-    print(f"[Rank {local_rank}] Extracting {prefix} {split} shard ({len(shard_ds)} samples)...")
-    extract_embeddings_to_cache(model, shard_loader, device, shard_path)
+    print(f"[Rank {local_rank}] Extracting {prefix} {split} shard ({len(shard_ds)} samples)...", flush=True)
+    extract_embeddings_to_cache(model, shard_loader, device, shard_path, autocast_dtype=autocast_dtype)
 
     dist.barrier()
 
@@ -216,7 +248,7 @@ def load_or_extract_embeddings(
     return embeds, targets, image_ids
 
   print_rank0(f"Extracting {prefix} {split} embeddings with frozen backbone...")
-  embeds, targets, image_ids = extract_embeddings_to_cache(model, loader, device, cache_path)
+  embeds, targets, image_ids = extract_embeddings_to_cache(model, loader, device, cache_path, autocast_dtype=autocast_dtype)
   print_rank0(f"Saved {len(embeds)} {prefix} {split} embeddings to {cache_path}.")
   return embeds, targets, image_ids
 
@@ -431,6 +463,7 @@ def main() -> None:
       no_cache=args.no_cache,
       is_ddp=is_ddp,
       local_rank=local_rank,
+      autocast_dtype=autocast_dtype,
     )
     t_val_embeds, t_val_targets, _ = load_or_extract_embeddings(
       prefix="teacher",
@@ -442,6 +475,7 @@ def main() -> None:
       no_cache=args.no_cache,
       is_ddp=is_ddp,
       local_rank=local_rank,
+      autocast_dtype=autocast_dtype,
     )
 
     print_rank0(f"Training teacher projection head for {args.teacher_epochs} epochs (DDP={is_ddp})...")
@@ -627,6 +661,7 @@ def main() -> None:
       no_cache=args.no_cache,
       is_ddp=is_ddp,
       local_rank=local_rank,
+      autocast_dtype=autocast_dtype,
     )
     s_val_embeds, s_val_targets, _ = load_or_extract_embeddings(
       prefix="student",
@@ -638,6 +673,7 @@ def main() -> None:
       no_cache=args.no_cache,
       is_ddp=is_ddp,
       local_rank=local_rank,
+      autocast_dtype=autocast_dtype,
     )
 
     del student_model

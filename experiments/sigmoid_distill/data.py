@@ -87,11 +87,10 @@ class CocoDataset(Dataset):
     elif image.shape[0] == 4:
       image = image[:3, :, :]
 
-    # Convert uint8 [0..255] to float32 [0.0..1.0]
-    image = image.float() / 255.0
-
     if self.transform is not None:
       image = self.transform(image)
+    else:
+      image = image.float() / 255.0
 
     target = torch.from_numpy(self.labels[index])
     return image, target, sample.id

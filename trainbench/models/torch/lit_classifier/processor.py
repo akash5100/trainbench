@@ -24,6 +24,7 @@ class LitClassifierProcessor:
           interpolation=transforms.InterpolationMode.BILINEAR,
           antialias=True,
         ),
+        transforms.ConvertImageDtype(torch.float32),
         transforms.Normalize(
           mean=self.config.image_mean,
           std=self.config.image_std,
