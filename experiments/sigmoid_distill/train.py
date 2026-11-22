@@ -126,7 +126,7 @@ def extract_embeddings_to_cache(
         speed = step / max(1e-5, elapsed)
         eta = (total_batches - step) / max(1e-5, speed)
         rank_str = f"[GPU {device.index}] " if (device.type == "cuda" and device.index is not None) else ""
-        print(f"  {rank_str}[Extraction] Batch {step:04d}/{total_batches:04d} | Speed: {speed:.1f} b/s | ETA: {eta:.0f}s")
+        print(f"  {rank_str}[Extraction] Batch {step:04d}/{total_batches:04d} | Speed: {speed:.1f} b/s | ETA: {eta:.0f}s", flush=True)
 
   embeds_cat = torch.cat(all_embeds, dim=0)
   targets_cat = torch.cat(all_targets, dim=0)

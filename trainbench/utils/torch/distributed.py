@@ -51,8 +51,9 @@ def is_main_process() -> bool:  # slop-ok: distributed rank helper
 
 
 def print_rank0(*args: Any, **kwargs: Any) -> None:
-  """Prints messages only from rank 0 (main process)."""
+  """Prints messages only from rank 0 (main process) with forced buffer flushing."""
   if is_main_process():
+    kwargs.setdefault("flush", True)
     builtins.print(*args, **kwargs)
 
 
