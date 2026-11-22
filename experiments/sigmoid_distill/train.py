@@ -10,9 +10,12 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data.distributed import DistributedSampler
 
 from trainbench.losses.torch import BCEWithLogitsLoss, SigmoidDistillationLoss
 from trainbench.models.torch.lit_classifier import LitClassifierConfig, LitClassifierModel, LitClassifierProcessor, MultiLabelHead
@@ -329,7 +332,11 @@ def main() -> None:
   # ━━━━━━━━ Hardware & Distributed Runtime ━━━━━━━━
   seed_everything(args.seed)
   local_rank, is_ddp = setup_ddp()
-  device = get_device(verbose=(local_rank == 0))
+  if torch.cuda.is_available() and is_ddp:
+    device = torch.device(f"cuda:{local_rank}")
+  else:
+    device = get_device(verbose=(local_rank == 0))
+
   scaler = configure_mixed_precision(args.mixed_precision, device=device)
   autocast_dtype = get_autocast_dtype(device)
 
@@ -372,30 +379,37 @@ def main() -> None:
       shuffle=False,
     )
 
-    t_train_embeds, t_train_targets, t_train_ids = load_or_extract_embeddings(
-      prefix="teacher",
-      split="train",
-      cache_dir=cache_dir,
-      model=teacher_model,
-      loader=raw_train_loader,
-      device=device,
-      no_cache=args.no_cache,
-    )
-    t_val_embeds, t_val_targets, _ = load_or_extract_embeddings(
-      prefix="teacher",
-      split="val",
-      cache_dir=cache_dir,
-      model=teacher_model,
-      loader=raw_val_loader,
-      device=device,
-      no_cache=args.no_cache,
-    )
+    if is_ddp:
+      if local_rank == 0:
+        load_or_extract_embeddings(
+          prefix="teacher", split="train", cache_dir=cache_dir, model=teacher_model, loader=raw_train_loader, device=device, no_cache=args.no_cache
+        )
+        load_or_extract_embeddings(
+          prefix="teacher", split="val", cache_dir=cache_dir, model=teacher_model, loader=raw_val_loader, device=device, no_cache=args.no_cache
+        )
+      dist.barrier()
+      t_train_embeds, t_train_targets, t_train_ids = load_or_extract_embeddings(
+        prefix="teacher", split="train", cache_dir=cache_dir, model=teacher_model, loader=raw_train_loader, device=device, no_cache=False
+      )
+      t_val_embeds, t_val_targets, _ = load_or_extract_embeddings(
+        prefix="teacher", split="val", cache_dir=cache_dir, model=teacher_model, loader=raw_val_loader, device=device, no_cache=False
+      )
+    else:
+      t_train_embeds, t_train_targets, t_train_ids = load_or_extract_embeddings(
+        prefix="teacher", split="train", cache_dir=cache_dir, model=teacher_model, loader=raw_train_loader, device=device, no_cache=args.no_cache
+      )
+      t_val_embeds, t_val_targets, _ = load_or_extract_embeddings(
+        prefix="teacher", split="val", cache_dir=cache_dir, model=teacher_model, loader=raw_val_loader, device=device, no_cache=args.no_cache
+      )
 
     print_rank0(f"Training teacher projection head for {args.teacher_epochs} epochs (DDP={is_ddp})...")
+    teacher_train_ds = TensorDataset(t_train_embeds, t_train_targets)
+    teacher_sampler = DistributedSampler(teacher_train_ds, shuffle=True) if is_ddp else None
     teacher_train_loader = DataLoader(
-      TensorDataset(t_train_embeds, t_train_targets),
+      teacher_train_ds,
       batch_size=args.batch_size,
-      shuffle=True,
+      shuffle=(teacher_sampler is None),
+      sampler=teacher_sampler,
     )
     teacher_val_loader = DataLoader(
       TensorDataset(t_val_embeds, t_val_targets),
@@ -406,6 +420,8 @@ def main() -> None:
     teacher_head = teacher_model.head
     if args.compile:
       teacher_head = torch.compile(teacher_head)  # type: ignore[assignment]
+    if is_ddp:
+      teacher_head = DDP(teacher_head, device_ids=[local_rank])
 
     t_optimizer = build_optimizer(teacher_head, lr=args.lr, weight_decay=args.weight_decay)
     t_total_steps = len(teacher_train_loader) * args.teacher_epochs // args.grad_accum
@@ -419,6 +435,9 @@ def main() -> None:
     t_step = 0
 
     for epoch in range(1, args.teacher_epochs + 1):
+      if teacher_sampler is not None:
+        teacher_sampler.set_epoch(epoch)
+
       t_metrics, t_step = train_one_epoch(
         model=teacher_head,
         dataloader=teacher_train_loader,
@@ -449,39 +468,42 @@ def main() -> None:
       )
       if t_val_metrics["macro_f1"] > best_teacher_f1:
         best_teacher_f1 = t_val_metrics["macro_f1"]
-        raw_head = getattr(teacher_head, "_orig_mod", teacher_head)
+        raw_head = teacher_head.module if hasattr(teacher_head, "module") else getattr(teacher_head, "_orig_mod", teacher_head)
         best_teacher_state = {k: v.cpu().clone() for k, v in raw_head.state_dict().items()}
         if local_rank == 0:
           torch.save(best_teacher_state, teacher_head_ckpt_path)
 
-    raw_head = getattr(teacher_head, "_orig_mod", teacher_head)
+    raw_head = teacher_head.module if hasattr(teacher_head, "module") else getattr(teacher_head, "_orig_mod", teacher_head)
     if best_teacher_state is not None:
       raw_head.load_state_dict(best_teacher_state)
     elif teacher_head_ckpt_path.exists():
       raw_head.load_state_dict(torch.load(teacher_head_ckpt_path, map_location="cpu"))
 
-    print_rank0("Computing teacher logits on train split for distillation cache...")
-    raw_head.eval()
-    t_logits_list: list[torch.Tensor] = []
-    deterministic_t_loader = DataLoader(
-      TensorDataset(t_train_embeds),
-      batch_size=args.batch_size,
-      shuffle=False,
-    )
-    with torch.no_grad():
-      for (batch_embeds,) in deterministic_t_loader:
-        batch_embeds = batch_embeds.to(device)
-        logits = raw_head(batch_embeds)
-        t_logits_list.append(logits.cpu())
-
-    t_logits_all = torch.cat(t_logits_list, dim=0).numpy()
     if local_rank == 0:
+      print_rank0("Computing teacher logits on train split for distillation cache...")
+      raw_head.eval()
+      t_logits_list: list[torch.Tensor] = []
+      deterministic_t_loader = DataLoader(
+        TensorDataset(t_train_embeds),
+        batch_size=args.batch_size,
+        shuffle=False,
+      )
+      with torch.no_grad():
+        for (batch_embeds,) in deterministic_t_loader:
+          batch_embeds = batch_embeds.to(device)
+          logits = raw_head(batch_embeds)
+          t_logits_list.append(logits.cpu())
+
+      t_logits_all = torch.cat(t_logits_list, dim=0).numpy()
       np.savez_compressed(
         teacher_logits_path,
         logits=t_logits_all,
         image_ids=t_train_ids,
       )
       print_rank0(f"Saved {len(t_logits_all)} teacher train logits to {teacher_logits_path}.")
+
+    if is_ddp:
+      dist.barrier()
 
     del teacher_model
     del teacher_head
@@ -513,24 +535,28 @@ def main() -> None:
       shuffle=False,
     )
 
-    s_train_embeds, s_train_targets, s_train_ids = load_or_extract_embeddings(
-      prefix="student",
-      split="train",
-      cache_dir=cache_dir,
-      model=student_model,
-      loader=raw_s_train_loader,
-      device=device,
-      no_cache=args.no_cache,
-    )
-    s_val_embeds, s_val_targets, _ = load_or_extract_embeddings(
-      prefix="student",
-      split="val",
-      cache_dir=cache_dir,
-      model=student_model,
-      loader=raw_s_val_loader,
-      device=device,
-      no_cache=args.no_cache,
-    )
+    if is_ddp:
+      if local_rank == 0:
+        load_or_extract_embeddings(
+          prefix="student", split="train", cache_dir=cache_dir, model=student_model, loader=raw_s_train_loader, device=device, no_cache=args.no_cache
+        )
+        load_or_extract_embeddings(
+          prefix="student", split="val", cache_dir=cache_dir, model=student_model, loader=raw_s_val_loader, device=device, no_cache=args.no_cache
+        )
+      dist.barrier()
+      s_train_embeds, s_train_targets, s_train_ids = load_or_extract_embeddings(
+        prefix="student", split="train", cache_dir=cache_dir, model=student_model, loader=raw_s_train_loader, device=device, no_cache=False
+      )
+      s_val_embeds, s_val_targets, _ = load_or_extract_embeddings(
+        prefix="student", split="val", cache_dir=cache_dir, model=student_model, loader=raw_s_val_loader, device=device, no_cache=False
+      )
+    else:
+      s_train_embeds, s_train_targets, s_train_ids = load_or_extract_embeddings(
+        prefix="student", split="train", cache_dir=cache_dir, model=student_model, loader=raw_s_train_loader, device=device, no_cache=args.no_cache
+      )
+      s_val_embeds, s_val_targets, _ = load_or_extract_embeddings(
+        prefix="student", split="val", cache_dir=cache_dir, model=student_model, loader=raw_s_val_loader, device=device, no_cache=args.no_cache
+      )
 
     del student_model
     if torch.cuda.is_available():
@@ -556,10 +582,12 @@ def main() -> None:
   # ━━━━━━━━ Phase 3: Student Distillation Training ━━━━━━━━
   print_rank0(f"Phase 3: Starting student distillation (alpha={args.alpha}, temperature={args.temperature}, epochs={args.student_epochs})...")
   student_train_ds = TensorDataset(s_train_embeds, s_train_targets, t_train_logits)
+  student_sampler = DistributedSampler(student_train_ds, shuffle=True) if is_ddp else None
   student_train_loader = DataLoader(
     student_train_ds,
     batch_size=args.batch_size,
-    shuffle=True,
+    shuffle=(student_sampler is None),
+    sampler=student_sampler,
   )
   student_val_ds = TensorDataset(s_val_embeds, s_val_targets)
   student_val_loader = DataLoader(
@@ -580,6 +608,8 @@ def main() -> None:
 
   if args.compile:
     student_head = torch.compile(student_head)  # type: ignore[assignment]
+  if is_ddp:
+    student_head = DDP(student_head, device_ids=[local_rank])
 
   s_optimizer = build_optimizer(student_head, lr=args.lr, weight_decay=args.weight_decay)
   s_total_steps = len(student_train_loader) * args.student_epochs // args.grad_accum
@@ -594,6 +624,9 @@ def main() -> None:
   student_best_ckpt_path = save_dir / f"{args.run_name}_best.pt"
 
   for epoch in range(1, args.student_epochs + 1):
+    if student_sampler is not None:
+      student_sampler.set_epoch(epoch)
+
     epoch_start = time.time()
     s_metrics, s_step = train_one_epoch(
       model=student_head,
@@ -643,7 +676,7 @@ def main() -> None:
 
     if s_val_metrics["macro_f1"] > best_student_f1:
       best_student_f1 = s_val_metrics["macro_f1"]
-      raw_head = getattr(student_head, "_orig_mod", student_head)
+      raw_head = student_head.module if hasattr(student_head, "module") else getattr(student_head, "_orig_mod", student_head)
       if local_rank == 0:
         torch.save(raw_head.state_dict(), student_best_ckpt_path)
         print_rank0(f"  -> Saved best student head checkpoint to {student_best_ckpt_path} (macro_f1: {best_student_f1:.4f})")
@@ -657,6 +690,8 @@ def main() -> None:
       wandb.finish()
     except Exception:
       pass
+  if is_ddp:
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
