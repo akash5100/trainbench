@@ -540,14 +540,29 @@ def main() -> None:
         f"Train Loss: {t_metrics['loss']:.4f} | "
         f"Val Loss: {t_val_metrics['loss']:.4f} | "
         f"Val Macro-F1: {t_val_metrics['macro_f1']:.4f} | "
-        f"Val mAP: {t_val_metrics['map']:.4f}"
+        f"Val mAP: {t_val_metrics['map']:.4f} | "
+        f"Neg Mean: {t_val_metrics['neg_prob_mean']:.4f}"
       )
+      if args.wandb:
+        log_async(
+          {
+            "teacher/epoch": epoch,
+            "teacher/train_loss": t_metrics["loss"],
+            "teacher/val_loss": t_val_metrics["loss"],
+            "teacher/val_macro_f1": t_val_metrics["macro_f1"],
+            "teacher/val_map": t_val_metrics["map"],
+            "teacher/val_neg_prob_mean": t_val_metrics["neg_prob_mean"],
+            "teacher/val_majority_fp": t_val_metrics["majority_fp"],
+          },
+          step=t_step,
+        )
       if t_val_metrics["macro_f1"] > best_teacher_f1:
         best_teacher_f1 = t_val_metrics["macro_f1"]
         raw_head = teacher_head.module if hasattr(teacher_head, "module") else getattr(teacher_head, "_orig_mod", teacher_head)
         best_teacher_state = {k: v.cpu().clone() for k, v in raw_head.state_dict().items()}
         if local_rank == 0:
           torch.save(best_teacher_state, teacher_head_ckpt_path)
+          print_rank0(f"  -> Saved best teacher checkpoint to {teacher_head_ckpt_path} (macro_f1: {best_teacher_f1:.4f})")
 
     raw_head = teacher_head.module if hasattr(teacher_head, "module") else getattr(teacher_head, "_orig_mod", teacher_head)
     if best_teacher_state is not None:
