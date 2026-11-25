@@ -6,14 +6,16 @@ from trainbench.lazy import create_lazy_importer
 
 
 if TYPE_CHECKING:
-  from .multi_label import compute_multi_label_metrics
+  from .multi_label import compute_multi_label_metrics, compute_per_class_confusion
 
 _LAZY_IMPORTS = {
   "compute_multi_label_metrics": "multi_label",
+  "compute_per_class_confusion": "multi_label",
 }
 
 __all__ = [
   "compute_multi_label_metrics",
+  "compute_per_class_confusion",
 ]
 
 __getattr__ = create_lazy_importer(_LAZY_IMPORTS, __name__)

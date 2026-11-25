@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +19,38 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 
 from trainbench.losses.torch import BCEWithLogitsLoss, SigmoidDistillationLoss
-from trainbench.metrics.torch import compute_multi_label_metrics
+from trainbench.metrics.torch import compute_multi_label_metrics, compute_per_class_confusion
 from trainbench.models.torch.lit_classifier import LitClassifierConfig, LitClassifierModel, LitClassifierProcessor, MultiLabelHead
-from trainbench.utils import log_async, shutdown_logger
+from trainbench.utils import finish_wandb, init_wandb, log_async, shutdown_logger
 from trainbench.utils.torch import clip_gradients, configure_mixed_precision, get_autocast_dtype, get_device, print_rank0, seed_everything, setup_ddp
 
-from .data import build_dataloaders
+from .data import build_dataloaders, load_coco_metadata
+
+
+# ━━━━━━━━ Runtime Context ━━━━━━━━
+
+
+@dataclass(frozen=True)
+class RuntimeContext:
+  """Bundles accelerator, mixed-precision, and distributed rank state."""
+
+  device: torch.device
+  scaler: torch.amp.GradScaler
+  autocast_dtype: torch.dtype
+  is_ddp: bool
+  local_rank: int
 
 
 # ━━━━━━━━ CLI Configuration ━━━━━━━━
+
+
+def _model_short_tag(model_id: str) -> str:
+  """Extracts a concise model architecture identifier for clean run naming."""
+  name = Path(model_id).name.lower()
+  for tag in ("so400m", "base", "large", "tiny", "small"):
+    if tag in name:
+      return tag
+  return name
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,14 +112,15 @@ def parse_args() -> argparse.Namespace:
   if args.grad_accum < 1:
     args.grad_accum = 1
   if args.run_name is None:
-    args.run_name = f"student_T{args.temperature}_a{args.alpha}"
+    student_tag = _model_short_tag(args.student_model)
+    args.run_name = f"{student_tag}_T{args.temperature}_a{args.alpha}"
   return args
 
 
 # ━━━━━━━━ Embedding Cache Helpers ━━━━━━━━
 
 
-def extract_embeddings_to_cache(
+def forward_pass_and_cache_embeddings(
   model: LitClassifierModel,
   loader: DataLoader[Any],
   device: torch.device,
@@ -179,11 +204,8 @@ def load_or_extract_embeddings(
   cache_dir: Path,
   model: LitClassifierModel,
   loader: DataLoader[Any],
-  device: torch.device,
+  ctx: RuntimeContext,
   no_cache: bool = False,
-  is_ddp: bool = False,
-  local_rank: int = 0,
-  autocast_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
   """Loads cached embeddings or extracts them across all available GPUs in parallel."""
   cache_path = cache_dir / f"{prefix}_embeds_{split}.npz"
@@ -195,13 +217,13 @@ def load_or_extract_embeddings(
       image_ids = data["image_ids"]
     return embeds, targets, image_ids
 
-  world_size = dist.get_world_size() if (is_ddp and dist.is_initialized()) else 1
+  world_size = dist.get_world_size() if (ctx.is_ddp and dist.is_initialized()) else 1
 
   if world_size > 1:
     dataset = loader.dataset
     total_samples = len(dataset)
     chunk = (total_samples + world_size - 1) // world_size
-    start_idx = local_rank * chunk
+    start_idx = ctx.local_rank * chunk
     end_idx = min(total_samples, start_idx + chunk)
 
     shard_ds = Subset(dataset, range(start_idx, end_idx))
@@ -212,13 +234,13 @@ def load_or_extract_embeddings(
       num_workers=loader.num_workers,
       pin_memory=torch.cuda.is_available(),
     )
-    shard_path = cache_dir / f"{prefix}_embeds_{split}_shard_{local_rank}.npz"
-    print(f"[Rank {local_rank}] Extracting {prefix} {split} shard ({len(shard_ds)} samples)...", flush=True)
-    extract_embeddings_to_cache(model, shard_loader, device, shard_path, autocast_dtype=autocast_dtype)
+    shard_path = cache_dir / f"{prefix}_embeds_{split}_shard_{ctx.local_rank}.npz"
+    print(f"[Rank {ctx.local_rank}] Extracting {prefix} {split} shard ({len(shard_ds)} samples)...", flush=True)
+    forward_pass_and_cache_embeddings(model, shard_loader, ctx.device, shard_path, autocast_dtype=ctx.autocast_dtype)
 
     dist.barrier()
 
-    if local_rank == 0:
+    if ctx.local_rank == 0:
       all_embeds: list[np.ndarray] = []
       all_targets: list[np.ndarray] = []
       all_ids: list[np.ndarray] = []
@@ -248,7 +270,7 @@ def load_or_extract_embeddings(
     return embeds, targets, image_ids
 
   print_rank0(f"Extracting {prefix} {split} embeddings with frozen backbone...")
-  embeds, targets, image_ids = extract_embeddings_to_cache(model, loader, device, cache_path, autocast_dtype=autocast_dtype)
+  embeds, targets, image_ids = forward_pass_and_cache_embeddings(model, loader, ctx.device, cache_path, autocast_dtype=ctx.autocast_dtype)
   print_rank0(f"Saved {len(embeds)} {prefix} {split} embeddings to {cache_path}.")
   return embeds, targets, image_ids
 
@@ -290,6 +312,12 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float) -> torch.o
   return torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.999), eps=1e-8)
 
 
+def unwrap_model(model: nn.Module) -> nn.Module:
+  """Unwraps DDP and torch.compile wrappers to access the underlying module."""
+  unwrapped = model.module if hasattr(model, "module") else model
+  return getattr(unwrapped, "_orig_mod", unwrapped)
+
+
 # ━━━━━━━━ Epoch Training & Validation Routines ━━━━━━━━
 
 
@@ -298,9 +326,7 @@ def train_one_epoch(
   dataloader: DataLoader[Any],
   optimizer: torch.optim.Optimizer,
   criterion: nn.Module,
-  device: torch.device,
-  scaler: torch.amp.GradScaler,
-  autocast_dtype: torch.dtype,
+  ctx: RuntimeContext,
   clip_grad: float = 1.0,
   accum_steps: int = 1,
   scheduler: Any = None,
@@ -317,26 +343,26 @@ def train_one_epoch(
 
   for step, batch in enumerate(dataloader):
     # Transfer inputs to target accelerator device
-    embeds, targets = batch[0].to(device), batch[1].to(device)
+    embeds, targets = batch[0].to(ctx.device), batch[1].to(ctx.device)
 
     # Forward pass and scaled loss calculation under mixed precision
-    with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=scaler.is_enabled()):
+    with torch.amp.autocast(device_type=ctx.device.type, dtype=ctx.autocast_dtype, enabled=ctx.scaler.is_enabled()):
       logits = model(embeds)
-      raw_loss = criterion(logits, batch[2].to(device), targets)["loss"] if len(batch) == 3 else criterion(logits, targets)
+      raw_loss = criterion(logits, batch[2].to(ctx.device), targets)["loss"] if len(batch) == 3 else criterion(logits, targets)
       loss = raw_loss / accum_steps
 
     # Backward pass with dynamic loss scaling
-    scaler.scale(loss).backward()
+    ctx.scaler.scale(loss).backward()
     total_loss += loss.item() * accum_steps
     num_batches += 1
 
     # Optimizer step, gradient unscaling, and clipping at accumulation boundaries
     if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
-      scaler.unscale_(optimizer)
+      ctx.scaler.unscale_(optimizer)
       grad_norm = clip_gradients(model, max_norm=clip_grad)
       total_grad_norm += grad_norm
-      scaler.step(optimizer)
-      scaler.update()
+      ctx.scaler.step(optimizer)
+      ctx.scaler.update()
       optimizer.zero_grad(set_to_none=True)
       if scheduler is not None:
         scheduler.step()
@@ -365,32 +391,199 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate(
+def evaluate(
   model: nn.Module,
   dataloader: DataLoader[Any],
-  device: torch.device,
-  autocast_dtype: torch.dtype,
-  use_amp: bool = False,
+  ctx: RuntimeContext,
+  epoch: int | None = None,
+  train_loss: float | None = None,
+  log_fn: Callable[[dict[str, Any], int], None] | None = None,
+  step: int | None = None,
+  report_confusion: bool = False,
+  tag: str = "Eval",
+  class_names: list[str] | None = None,
+  use_wandb: bool = False,
 ) -> dict[str, float]:
-  """Evaluates model performance across the validation dataset, returning ranking and calibration metrics."""
+  """Evaluates validation performance, logs unified epoch metrics, and optionally reports the full confusion matrix."""
   model.eval()
   all_logits_list: list[torch.Tensor] = []
   all_targets_list: list[torch.Tensor] = []
 
-  # Forward pass across validation batches under mixed precision
-  with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_amp):
+  with torch.amp.autocast(device_type=ctx.device.type, dtype=ctx.autocast_dtype, enabled=ctx.scaler.is_enabled()):
     for batch in dataloader:
-      embeds, targets = batch[0].to(device), batch[1]
+      embeds, targets = batch[0].to(ctx.device), batch[1]
       logits = model(embeds)
       all_logits_list.append(logits.detach().cpu())
       all_targets_list.append(targets.cpu())
 
-  # Concatenate predictions across all batches
   all_logits = torch.cat(all_logits_list, dim=0)
   all_targets = torch.cat(all_targets_list, dim=0)
+  metrics = compute_multi_label_metrics(all_logits, all_targets)
 
-  # Compute standardized multi-label classification and calibration metrics
-  return compute_multi_label_metrics(all_logits, all_targets)
+  if log_fn is not None and step is not None:
+    payload: dict[str, Any] = {
+      "val/loss": metrics["loss"],
+      "val/macro_precision": metrics["macro_precision"],
+      "val/macro_recall": metrics["macro_recall"],
+      "val/macro_f1": metrics["macro_f1"],
+      "val/precision": metrics["micro_precision"],
+      "val/recall": metrics["micro_recall"],
+      "val/f1": metrics["micro_f1"],
+      "val/map": metrics["map"],
+      "val/neg_prob_mean": metrics["neg_prob_mean"],
+      "val/majority_fp": metrics["majority_fp"],
+    }
+    if epoch is not None:
+      payload["train/epoch"] = epoch
+    if train_loss is not None:
+      payload["train/epoch_loss"] = train_loss
+    log_fn(payload, step)
+
+  if report_confusion and ctx.local_rank == 0:
+    rows = compute_per_class_confusion(all_logits, all_targets)
+    names = class_names if class_names is not None else []
+    print_rank0(f"\n[{tag}] Full Per-Class Confusion Matrix ({len(rows)} classes, untruncated):")
+    print_rank0(f"{'ID':>3} | {'Class':<18} | {'TP':>5} | {'FP':>5} | {'FN':>5} | {'TN':>5} | {'Prec':>6} | {'Rec':>6} | {'F1':>6} | {'Supp':>5}")
+    print_rank0("-" * 92)
+
+    table_rows: list[list[Any]] = []
+    for row in rows:
+      cid = int(row["class_id"])
+      cname = names[cid] if cid < len(names) else f"class_{cid}"
+      print_rank0(
+        f"{cid:>3} | {cname:<18} | {int(row['tp']):>5} | {int(row['fp']):>5} | {int(row['fn']):>5} | {int(row['tn']):>5} | "
+        f"{float(row['precision']):>6.4f} | {float(row['recall']):>6.4f} | {float(row['f1']):>6.4f} | {int(row['support']):>5}"
+      )
+      table_rows.append(
+        [
+          cid,
+          cname,
+          int(row["tp"]),
+          int(row["fp"]),
+          int(row["fn"]),
+          int(row["tn"]),
+          float(row["precision"]),
+          float(row["recall"]),
+          float(row["f1"]),
+          int(row["support"]),
+        ]
+      )
+
+    if use_wandb:
+      try:
+        import wandb
+
+        if wandb.run is not None:
+          table = wandb.Table(
+            columns=["class_id", "class_name", "tp", "fp", "fn", "tn", "precision", "recall", "f1", "support"],
+            data=table_rows,
+          )
+          wandb.log({"val/confusion_matrix": table}, step=step)
+      except Exception:
+        pass
+
+  return metrics
+
+
+def train_head(
+  tag: str,
+  head: nn.Module,
+  train_ds: TensorDataset,
+  val_ds: TensorDataset,
+  criterion: nn.Module,
+  epochs: int,
+  ckpt_path: Path,
+  args: argparse.Namespace,
+  ctx: RuntimeContext,
+  class_names: list[str],
+) -> nn.Module:
+  """Trains a projection head on cached embeddings, restores best Macro-F1 weights, and logs final confusion."""
+  sampler = DistributedSampler(train_ds, shuffle=True) if ctx.is_ddp else None
+  train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(sampler is None), sampler=sampler)
+  val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+
+  if args.compile:
+    head = torch.compile(head)  # type: ignore[assignment]
+  if ctx.is_ddp:
+    head = DDP(head, device_ids=[ctx.local_rank])
+
+  optimizer = build_optimizer(head, lr=args.lr, weight_decay=args.weight_decay)
+  total_steps = len(train_loader) * epochs // args.grad_accum
+  warmup_iters = min(args.warmup_steps, max(1, total_steps))
+  warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_iters)
+  cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_iters), eta_min=args.lr * args.eta_min_ratio)
+  scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_iters])
+
+  best_f1 = -1.0
+  best_state: dict[str, Any] | None = None
+  step = 0
+
+  for epoch in range(1, epochs + 1):
+    if sampler is not None:
+      sampler.set_epoch(epoch)
+
+    epoch_start = time.time()
+    train_metrics, step = train_one_epoch(
+      model=head,
+      dataloader=train_loader,
+      optimizer=optimizer,
+      criterion=criterion,
+      ctx=ctx,
+      clip_grad=args.clip_grad,
+      accum_steps=args.grad_accum,
+      scheduler=scheduler,
+      log_fn=log_async if args.wandb else None,
+      global_step_start=step,
+    )
+    val_metrics = evaluate(
+      model=head,
+      dataloader=val_loader,
+      ctx=ctx,
+      epoch=epoch,
+      train_loss=train_metrics["loss"],
+      log_fn=log_async if args.wandb else None,
+      step=step,
+    )
+    elapsed = time.time() - epoch_start
+
+    print_rank0(
+      f"[{tag}] Epoch {epoch:02d}/{epochs:02d} | "
+      f"Train Loss: {train_metrics['loss']:.4f} | "
+      f"Val Loss: {val_metrics['loss']:.4f} | "
+      f"Val Macro-P/R/F1: {val_metrics['macro_precision']:.4f}/{val_metrics['macro_recall']:.4f}/{val_metrics['macro_f1']:.4f} | "
+      f"Val P/R/F1: {val_metrics['micro_precision']:.4f}/{val_metrics['micro_recall']:.4f}/{val_metrics['micro_f1']:.4f} | "
+      f"Val mAP: {val_metrics['map']:.4f} | "
+      f"Neg Mean: {val_metrics['neg_prob_mean']:.4f} | "
+      f"Maj FP: {int(val_metrics['majority_fp'])} | "
+      f"Time: {elapsed:.2f}s"
+    )
+
+    if val_metrics["macro_f1"] > best_f1:
+      best_f1 = val_metrics["macro_f1"]
+      raw_head = unwrap_model(head)
+      best_state = {k: v.cpu().clone() for k, v in raw_head.state_dict().items()}
+      if ctx.local_rank == 0:
+        torch.save(best_state, ckpt_path)
+        print_rank0(f"  -> Saved best {tag.lower()} checkpoint to {ckpt_path} (macro_f1: {best_f1:.4f})")
+
+  raw_head = unwrap_model(head)
+  if best_state is not None:
+    raw_head.load_state_dict(best_state)
+  elif ckpt_path.exists():
+    raw_head.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+  raw_head.eval()
+
+  evaluate(
+    model=raw_head,
+    dataloader=val_loader,
+    ctx=ctx,
+    step=step,
+    report_confusion=True,
+    tag=tag,
+    class_names=class_names,
+    use_wandb=args.wandb,
+  )
+  return raw_head
 
 
 # ━━━━━━━━ Main Entrypoint ━━━━━━━━
@@ -411,6 +604,13 @@ def main() -> None:
   # Configure automatic mixed precision scaler and compute datatype
   scaler = configure_mixed_precision(args.mixed_precision, device=device)
   autocast_dtype = get_autocast_dtype(device)
+  ctx = RuntimeContext(
+    device=device,
+    scaler=scaler,
+    autocast_dtype=autocast_dtype,
+    is_ddp=is_ddp,
+    local_rank=local_rank,
+  )
 
   # Ensure destination cache and checkpoint directories exist
   cache_dir = Path(args.cache_dir)
@@ -421,18 +621,17 @@ def main() -> None:
   teacher_logits_path = cache_dir / "teacher_logits_train.npz"
   teacher_head_ckpt_path = save_dir / "teacher_head_best.pt"
 
+  val_ann_path = Path(args.data_root) / "annotations" / "instances_val2017.json"
+  if val_ann_path.exists():
+    _, _, class_names = load_coco_metadata(Path(args.data_root), split="val2017")
+  else:
+    class_names = [f"class_{i}" for i in range(args.num_classes)]
+
   # ━━━━━━━━ Phase 1: Teacher Training & Logit Caching ━━━━━━━━
   if teacher_logits_path.exists() and not args.no_cache:
     print_rank0(f"Found cached teacher logits at {teacher_logits_path}. Skipping Phase 1.")
   else:
-    if args.wandb and (local_rank == 0):
-      try:
-        import wandb
-
-        teacher_run_name = f"teacher_{Path(args.teacher_model).name}"
-        wandb.init(project=args.project, name=teacher_run_name, config=vars(args))
-      except ImportError:
-        print_rank0("WandB requested but not installed. Skipping remote logging.")
+    init_wandb(args.project, f"{_model_short_tag(args.teacher_model)}_teacher", config=vars(args), enabled=args.wandb, rank=local_rank)
 
     print_rank0(f"Phase 1: Initializing teacher model ({args.teacher_model})...")
     teacher_cfg = LitClassifierConfig.from_pretrained(
@@ -459,11 +658,8 @@ def main() -> None:
       cache_dir=cache_dir,
       model=teacher_model,
       loader=raw_train_loader,
-      device=device,
+      ctx=ctx,
       no_cache=args.no_cache,
-      is_ddp=is_ddp,
-      local_rank=local_rank,
-      autocast_dtype=autocast_dtype,
     )
     t_val_embeds, t_val_targets, _ = load_or_extract_embeddings(
       prefix="teacher",
@@ -471,107 +667,25 @@ def main() -> None:
       cache_dir=cache_dir,
       model=teacher_model,
       loader=raw_val_loader,
-      device=device,
+      ctx=ctx,
       no_cache=args.no_cache,
-      is_ddp=is_ddp,
-      local_rank=local_rank,
-      autocast_dtype=autocast_dtype,
     )
 
     print_rank0(f"Training teacher projection head for {args.teacher_epochs} epochs (DDP={is_ddp})...")
-    teacher_train_ds = TensorDataset(t_train_embeds, t_train_targets)
-    teacher_sampler = DistributedSampler(teacher_train_ds, shuffle=True) if is_ddp else None
-    teacher_train_loader = DataLoader(
-      teacher_train_ds,
-      batch_size=args.batch_size,
-      shuffle=(teacher_sampler is None),
-      sampler=teacher_sampler,
+    raw_head = train_head(
+      tag="Teacher",
+      head=teacher_model.head,
+      train_ds=TensorDataset(t_train_embeds, t_train_targets),
+      val_ds=TensorDataset(t_val_embeds, t_val_targets),
+      criterion=BCEWithLogitsLoss(reduction="mean"),
+      epochs=args.teacher_epochs,
+      ckpt_path=teacher_head_ckpt_path,
+      args=args,
+      ctx=ctx,
+      class_names=class_names,
     )
-    teacher_val_loader = DataLoader(
-      TensorDataset(t_val_embeds, t_val_targets),
-      batch_size=args.batch_size,
-      shuffle=False,
-    )
-
-    teacher_head = teacher_model.head
-    if args.compile:
-      teacher_head = torch.compile(teacher_head)  # type: ignore[assignment]
-    if is_ddp:
-      teacher_head = DDP(teacher_head, device_ids=[local_rank])
-
-    t_optimizer = build_optimizer(teacher_head, lr=args.lr, weight_decay=args.weight_decay)
-    t_total_steps = len(teacher_train_loader) * args.teacher_epochs // args.grad_accum
-    t_warmup = LinearLR(t_optimizer, start_factor=0.01, end_factor=1.0, total_iters=min(args.warmup_steps, max(1, t_total_steps)))
-    t_cosine = CosineAnnealingLR(t_optimizer, T_max=max(1, t_total_steps - args.warmup_steps), eta_min=args.lr * args.eta_min_ratio)
-    t_scheduler = SequentialLR(t_optimizer, schedulers=[t_warmup, t_cosine], milestones=[min(args.warmup_steps, max(1, t_total_steps))])
-    t_criterion = BCEWithLogitsLoss(reduction="mean")
-
-    best_teacher_f1 = -1.0
-    best_teacher_state: dict[str, Any] | None = None
-    t_step = 0
-
-    for epoch in range(1, args.teacher_epochs + 1):
-      if teacher_sampler is not None:
-        teacher_sampler.set_epoch(epoch)
-
-      t_metrics, t_step = train_one_epoch(
-        model=teacher_head,
-        dataloader=teacher_train_loader,
-        optimizer=t_optimizer,
-        criterion=t_criterion,
-        device=device,
-        scaler=scaler,
-        autocast_dtype=autocast_dtype,
-        clip_grad=args.clip_grad,
-        accum_steps=args.grad_accum,
-        scheduler=t_scheduler,
-        log_fn=log_async if args.wandb else None,
-        global_step_start=t_step,
-      )
-      t_val_metrics = validate(
-        model=teacher_head,
-        dataloader=teacher_val_loader,
-        device=device,
-        autocast_dtype=autocast_dtype,
-        use_amp=scaler.is_enabled(),
-      )
-      print_rank0(
-        f"[Teacher] Epoch {epoch:02d}/{args.teacher_epochs:02d} | "
-        f"Train Loss: {t_metrics['loss']:.4f} | "
-        f"Val Loss: {t_val_metrics['loss']:.4f} | "
-        f"Val Macro-F1: {t_val_metrics['macro_f1']:.4f} | "
-        f"Val mAP: {t_val_metrics['map']:.4f} | "
-        f"Neg Mean: {t_val_metrics['neg_prob_mean']:.4f}"
-      )
-      if args.wandb:
-        log_async(
-          {
-            "teacher/epoch": epoch,
-            "teacher/train_loss": t_metrics["loss"],
-            "teacher/val_loss": t_val_metrics["loss"],
-            "teacher/val_macro_f1": t_val_metrics["macro_f1"],
-            "teacher/val_map": t_val_metrics["map"],
-            "teacher/val_neg_prob_mean": t_val_metrics["neg_prob_mean"],
-            "teacher/val_majority_fp": t_val_metrics["majority_fp"],
-          },
-          step=t_step,
-        )
-      if t_val_metrics["macro_f1"] > best_teacher_f1:
-        best_teacher_f1 = t_val_metrics["macro_f1"]
-        raw_head = teacher_head.module if hasattr(teacher_head, "module") else getattr(teacher_head, "_orig_mod", teacher_head)
-        best_teacher_state = {k: v.cpu().clone() for k, v in raw_head.state_dict().items()}
-        if local_rank == 0:
-          torch.save(best_teacher_state, teacher_head_ckpt_path)
-          print_rank0(f"  -> Saved best teacher checkpoint to {teacher_head_ckpt_path} (macro_f1: {best_teacher_f1:.4f})")
-
-    raw_head = teacher_head.module if hasattr(teacher_head, "module") else getattr(teacher_head, "_orig_mod", teacher_head)
-    if best_teacher_state is not None:
-      raw_head.load_state_dict(best_teacher_state)
-    elif teacher_head_ckpt_path.exists():
-      raw_head.load_state_dict(torch.load(teacher_head_ckpt_path, map_location="cpu"))
 
     world_size = dist.get_world_size() if (is_ddp and dist.is_initialized()) else 1
-    raw_head.eval()
 
     if world_size > 1:
       total_t = len(t_train_embeds)
@@ -637,20 +751,12 @@ def main() -> None:
       print_rank0(f"Saved {len(t_logits_all)} teacher train logits to {teacher_logits_path}.")
 
     del teacher_model
-    del teacher_head
+    del raw_head
     if torch.cuda.is_available():
       torch.cuda.empty_cache()
 
     # Finalize teacher WandB session so student starts fresh from step 0
-    if args.wandb and (local_rank == 0):
-      shutdown_logger(wait=True)
-      try:
-        import wandb
-
-        if wandb.run is not None:
-          wandb.finish()
-      except Exception:
-        pass
+    finish_wandb(enabled=args.wandb, rank=local_rank)
 
   # ━━━━━━━━ Phase 2: Student Embeddings Extraction & Alignment ━━━━━━━━
   student_embeds_train_path = cache_dir / "student_embeds_train.npz"
@@ -683,11 +789,8 @@ def main() -> None:
       cache_dir=cache_dir,
       model=student_model,
       loader=raw_s_train_loader,
-      device=device,
+      ctx=ctx,
       no_cache=args.no_cache,
-      is_ddp=is_ddp,
-      local_rank=local_rank,
-      autocast_dtype=autocast_dtype,
     )
     s_val_embeds, s_val_targets, _ = load_or_extract_embeddings(
       prefix="student",
@@ -695,11 +798,8 @@ def main() -> None:
       cache_dir=cache_dir,
       model=student_model,
       loader=raw_s_val_loader,
-      device=device,
+      ctx=ctx,
       no_cache=args.no_cache,
-      is_ddp=is_ddp,
-      local_rank=local_rank,
-      autocast_dtype=autocast_dtype,
     )
 
     del student_model
@@ -724,30 +824,9 @@ def main() -> None:
   print_rank0(f"Verified 1:1 image_id alignment across {len(s_train_ids)} train samples.")
 
   # ━━━━━━━━ Phase 3: Student Distillation Training ━━━━━━━━
-  if args.wandb and (local_rank == 0):
-    try:
-      import wandb
-
-      wandb.init(project=args.project, name=args.run_name, config=vars(args))
-    except ImportError:
-      print_rank0("WandB requested but not installed. Skipping remote logging.")
+  init_wandb(args.project, args.run_name, config=vars(args), enabled=args.wandb, rank=local_rank)
 
   print_rank0(f"Phase 3: Starting student distillation (alpha={args.alpha}, temperature={args.temperature}, epochs={args.student_epochs})...")
-  student_train_ds = TensorDataset(s_train_embeds, s_train_targets, t_train_logits)
-  student_sampler = DistributedSampler(student_train_ds, shuffle=True) if is_ddp else None
-  student_train_loader = DataLoader(
-    student_train_ds,
-    batch_size=args.batch_size,
-    shuffle=(student_sampler is None),
-    sampler=student_sampler,
-  )
-  student_val_ds = TensorDataset(s_val_embeds, s_val_targets)
-  student_val_loader = DataLoader(
-    student_val_ds,
-    batch_size=args.batch_size,
-    shuffle=False,
-  )
-
   student_head = MultiLabelHead(
     embed_dim=student_cfg.embed_dim,
     num_classes=args.num_classes,
@@ -758,90 +837,22 @@ def main() -> None:
     print_rank0(f"Loading pretrained student head from {args.load_head}...")
     student_head.load_state_dict(torch.load(args.load_head, map_location=device))
 
-  if args.compile:
-    student_head = torch.compile(student_head)  # type: ignore[assignment]
-  if is_ddp:
-    student_head = DDP(student_head, device_ids=[local_rank])
-
-  s_optimizer = build_optimizer(student_head, lr=args.lr, weight_decay=args.weight_decay)
-  s_total_steps = len(student_train_loader) * args.student_epochs // args.grad_accum
-  s_warmup = LinearLR(s_optimizer, start_factor=0.01, end_factor=1.0, total_iters=min(args.warmup_steps, max(1, s_total_steps)))
-  s_cosine = CosineAnnealingLR(s_optimizer, T_max=max(1, s_total_steps - args.warmup_steps), eta_min=args.lr * args.eta_min_ratio)
-  s_scheduler = SequentialLR(s_optimizer, schedulers=[s_warmup, s_cosine], milestones=[min(args.warmup_steps, max(1, s_total_steps))])
-
-  s_criterion = SigmoidDistillationLoss(alpha=args.alpha, temperature=args.temperature)
-
-  best_student_f1 = -1.0
-  s_step = 0
-  student_best_ckpt_path = save_dir / f"{args.run_name}_best.pt"
-
-  for epoch in range(1, args.student_epochs + 1):
-    if student_sampler is not None:
-      student_sampler.set_epoch(epoch)
-
-    epoch_start = time.time()
-    s_metrics, s_step = train_one_epoch(
-      model=student_head,
-      dataloader=student_train_loader,
-      optimizer=s_optimizer,
-      criterion=s_criterion,
-      device=device,
-      scaler=scaler,
-      autocast_dtype=autocast_dtype,
-      clip_grad=args.clip_grad,
-      accum_steps=args.grad_accum,
-      scheduler=s_scheduler,
-      log_fn=log_async if args.wandb else None,
-      global_step_start=s_step,
-    )
-    s_val_metrics = validate(
-      model=student_head,
-      dataloader=student_val_loader,
-      device=device,
-      autocast_dtype=autocast_dtype,
-      use_amp=scaler.is_enabled(),
-    )
-    elapsed = time.time() - epoch_start
-
-    log_payload = {
-      "train/epoch": epoch,
-      "train/epoch_loss": s_metrics["loss"],
-      "val/loss": s_val_metrics["loss"],
-      "val/macro_f1": s_val_metrics["macro_f1"],
-      "val/map": s_val_metrics["map"],
-      "val/neg_prob_mean": s_val_metrics["neg_prob_mean"],
-      "val/majority_fp": s_val_metrics["majority_fp"],
-    }
-    if args.wandb:
-      log_async(log_payload, step=s_step)
-
-    print_rank0(
-      f"Epoch {epoch:02d}/{args.student_epochs:02d} | "
-      f"Train Loss: {s_metrics['loss']:.4f} | "
-      f"Val Loss: {s_val_metrics['loss']:.4f} | "
-      f"Val Macro-F1: {s_val_metrics['macro_f1']:.4f} | "
-      f"Val mAP: {s_val_metrics['map']:.4f} | "
-      f"Neg Mean: {s_val_metrics['neg_prob_mean']:.4f} | "
-      f"Maj FP: {int(s_val_metrics['majority_fp'])} | "
-      f"Time: {elapsed:.2f}s"
-    )
-
-    if s_val_metrics["macro_f1"] > best_student_f1:
-      best_student_f1 = s_val_metrics["macro_f1"]
-      raw_head = student_head.module if hasattr(student_head, "module") else getattr(student_head, "_orig_mod", student_head)
-      if local_rank == 0:
-        torch.save(raw_head.state_dict(), student_best_ckpt_path)
-        print_rank0(f"  -> Saved best student head checkpoint to {student_best_ckpt_path} (macro_f1: {best_student_f1:.4f})")
+  train_head(
+    tag="Student",
+    head=student_head,
+    train_ds=TensorDataset(s_train_embeds, s_train_targets, t_train_logits),
+    val_ds=TensorDataset(s_val_embeds, s_val_targets),
+    criterion=SigmoidDistillationLoss(alpha=args.alpha, temperature=args.temperature),
+    epochs=args.student_epochs,
+    ckpt_path=save_dir / f"{args.run_name}_best.pt",
+    args=args,
+    ctx=ctx,
+    class_names=class_names,
+  )
 
   # ━━━━━━━━ Execution Teardown ━━━━━━━━
+  finish_wandb(enabled=args.wandb, rank=local_rank)
   shutdown_logger(wait=True)
-  if args.wandb and (local_rank == 0):
-    try:
-      import wandb
-
-      wandb.finish()
-    except Exception:
-      pass
   if is_ddp:
     dist.destroy_process_group()
 

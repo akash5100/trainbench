@@ -6,14 +6,18 @@ from trainbench.lazy import create_lazy_importer
 
 
 if TYPE_CHECKING:
-  from .logger import log_async, shutdown_logger
+  from .logger import finish_wandb, init_wandb, log_async, shutdown_logger
 
 _LAZY_IMPORTS = {
+  "finish_wandb": "logger",
+  "init_wandb": "logger",
   "log_async": "logger",
   "shutdown_logger": "logger",
 }
 
 __all__ = [
+  "finish_wandb",
+  "init_wandb",
   "log_async",
   "shutdown_logger",
 ]
