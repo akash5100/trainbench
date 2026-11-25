@@ -340,6 +340,8 @@ def train_one_epoch(
   num_updates = 0
   total_grad_norm = 0.0
   global_step = global_step_start
+  grad_share: dict[str, float] = {}
+  epoch_grad_share: dict[str, float] = {}
 
   for step, batch in enumerate(dataloader):
     # Transfer inputs to target accelerator device
@@ -348,11 +350,25 @@ def train_one_epoch(
     # Forward pass and scaled loss calculation under mixed precision
     with torch.amp.autocast(device_type=ctx.device.type, dtype=ctx.autocast_dtype, enabled=ctx.scaler.is_enabled()):
       logits = model(embeds)
+      if step == 0 and logits.requires_grad:
+        logits.retain_grad()
       raw_loss = criterion(logits, batch[2].to(ctx.device), targets)["loss"] if len(batch) == 3 else criterion(logits, targets)
       loss = raw_loss / accum_steps
 
     # Backward pass with dynamic loss scaling
     ctx.scaler.scale(loss).backward()
+    if step == 0 and logits.grad is not None:
+      abs_grad = logits.grad.detach().float().abs()
+      pos_grad = abs_grad[targets > 0.5].sum().item()
+      neg_grad = abs_grad[targets <= 0.5].sum().item()
+      total_logit_grad = pos_grad + neg_grad
+      if total_logit_grad > 0.0:
+        grad_share = {
+          "train/pos_grad_share": pos_grad / total_logit_grad,
+          "train/neg_grad_share": neg_grad / total_logit_grad,
+        }
+        epoch_grad_share = dict(grad_share)
+
     total_loss += loss.item() * accum_steps
     num_batches += 1
 
@@ -373,19 +389,21 @@ def train_one_epoch(
       # Asynchronous step-level metric logging
       if log_fn:
         current_lr = optimizer.param_groups[0]["lr"]
-        log_fn(
-          {
-            "train/loss": loss.item() * accum_steps,
-            "train/grad_norm": grad_norm,
-            "train/lr": current_lr,
-          },
-          global_step,
-        )
+        step_payload: dict[str, Any] = {
+          "train/loss": loss.item() * accum_steps,
+          "train/grad_norm": grad_norm,
+          "train/lr": current_lr,
+          **grad_share,
+        }
+        grad_share.clear()
+        log_fn(step_payload, global_step)
 
   # Compile epoch-level loss and gradient norm summary
   metrics = {
     "loss": total_loss / max(1, num_batches),
     "grad_norm": total_grad_norm / max(1, num_updates),
+    "pos_grad_share": epoch_grad_share.get("train/pos_grad_share", 0.0),
+    "neg_grad_share": epoch_grad_share.get("train/neg_grad_share", 0.0),
   }
   return metrics, global_step
 
@@ -430,6 +448,7 @@ def evaluate(
       "val/recall": metrics["micro_recall"],
       "val/f1": metrics["micro_f1"],
       "val/map": metrics["map"],
+      "val/pos_prob_mean": metrics["pos_prob_mean"],
       "val/neg_prob_mean": metrics["neg_prob_mean"],
       "val/majority_fp": metrics["majority_fp"],
     }
@@ -553,7 +572,8 @@ def train_head(
       f"Val Macro-P/R/F1: {val_metrics['macro_precision']:.4f}/{val_metrics['macro_recall']:.4f}/{val_metrics['macro_f1']:.4f} | "
       f"Val P/R/F1: {val_metrics['micro_precision']:.4f}/{val_metrics['micro_recall']:.4f}/{val_metrics['micro_f1']:.4f} | "
       f"Val mAP: {val_metrics['map']:.4f} | "
-      f"Neg Mean: {val_metrics['neg_prob_mean']:.4f} | "
+      f"Pos/Neg Mean: {val_metrics['pos_prob_mean']:.4f}/{val_metrics['neg_prob_mean']:.4f} | "
+      f"Grad Share +/-: {train_metrics['pos_grad_share']:.2%}/{train_metrics['neg_grad_share']:.2%} | "
       f"Maj FP: {int(val_metrics['majority_fp'])} | "
       f"Time: {elapsed:.2f}s"
     )

@@ -79,7 +79,9 @@ def compute_multi_label_metrics(logits: torch.Tensor, targets: torch.Tensor) -> 
       ap_list.append(ap)
   map_score = float(np.mean(ap_list)) if ap_list else 0.0
 
-  # Mean predicted probability on true-negative entries (calibration check)
+  # Mean predicted probability on true-positive and true-negative entries (calibration check)
+  pos_mask = targets_f32 == 1.0
+  pos_prob_mean = probs[pos_mask].mean().item() if pos_mask.any() else 0.0
   neg_mask = targets_f32 == 0.0
   neg_prob_mean = probs[neg_mask].mean().item() if neg_mask.any() else 0.0
 
@@ -98,6 +100,7 @@ def compute_multi_label_metrics(logits: torch.Tensor, targets: torch.Tensor) -> 
     "micro_recall": micro_recall,
     "micro_f1": micro_f1,
     "map": map_score,
+    "pos_prob_mean": pos_prob_mean,
     "neg_prob_mean": neg_prob_mean,
     "majority_fp": float(majority_fp),
   }

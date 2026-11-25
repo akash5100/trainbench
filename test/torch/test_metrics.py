@@ -19,6 +19,7 @@ def test_compute_multi_label_metrics_shapes_and_values() -> None:
   assert "micro_recall" in metrics
   assert "micro_f1" in metrics
   assert "map" in metrics
+  assert "pos_prob_mean" in metrics
   assert "neg_prob_mean" in metrics
   assert "majority_fp" in metrics
 
@@ -30,6 +31,7 @@ def test_compute_multi_label_metrics_shapes_and_values() -> None:
   assert metrics["micro_f1"] == 1.0
   assert metrics["map"] == 1.0
   assert metrics["majority_fp"] == 0
+  assert metrics["pos_prob_mean"] > 0.9999
   assert metrics["neg_prob_mean"] < 1e-4
 
 
