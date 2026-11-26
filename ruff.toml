@@ -9,6 +9,7 @@ exclude = [
   "dist",
   ".trainbench/.cache",
   ".trainbench/worktree",
+  "*.ipynb",
 ]
 
 src = [
